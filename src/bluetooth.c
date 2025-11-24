@@ -226,12 +226,13 @@ static gboolean bt_conn_set_profile (gpointer user_data)
     VolumePulsePlugin *vol = (VolumePulsePlugin *) user_data;
     char *pacard, *msg;
     int res;
+    gboolean found = pulse_get_card_found (vol);
 
     // some devices take a very long time to be valid PulseAudio cards after connection
-    if (vol->bt_card_found == FALSE && vol->bt_retry_count++ < BT_PULSE_RETRIES) return TRUE;
+    if (!found && vol->bt_retry_count++ < BT_PULSE_RETRIES) return TRUE;
     vol->bt_retry_timer = 0;
 
-    if (!vol->bt_card_found)
+    if (!found)
     {
         DEBUG ("Bluetooth device not found by PulseAudio - timeout");
 
@@ -335,7 +336,7 @@ static void bt_cb_trusted (GObject *source, GAsyncResult *res, gpointer user_dat
     else
     {
         DEBUG ("Trusted OK - connecting");
-        vol->bt_card_found = FALSE;
+        pulse_reset_card_found (vol);
         GDBusInterface *interface = g_dbus_object_manager_get_interface (vol->bt_objmanager, vol->bt_conname, "org.bluez.Device1");
         if (interface)
         {

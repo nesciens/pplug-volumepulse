@@ -32,6 +32,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 extern void pulse_init (VolumePulsePlugin *vol);
 extern void pulse_terminate (VolumePulsePlugin *vol);
 
+extern gboolean pulse_get_card_found (VolumePulsePlugin *vol);
+extern void pulse_reset_card_found (VolumePulsePlugin *vol);
+
 extern int pulse_get_volume (VolumePulsePlugin *vol, gboolean input_control);
 extern int pulse_set_volume (VolumePulsePlugin *vol, int volume, gboolean input_control);
 

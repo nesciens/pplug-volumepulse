@@ -89,6 +89,7 @@ typedef struct
     char *pa_error_msg;                 /* Error message from success / fail callback */
     int pa_devices;                     /* Counter for pulse devices */
     guint pa_idle_timer;
+    gboolean pa_card_found;             /* Whether a new card has been found since this was reset */  
 
     /* Bluetooth interface */
     GDBusObjectManager *bt_objmanager;  /* D-Bus BlueZ object manager */
@@ -98,7 +99,6 @@ typedef struct
     gboolean bt_force_hsp;              /* Flag to override automatic profile selection */
     int bt_retry_count;                 /* Counter for polling read of profile on connection */
     guint bt_retry_timer;               /* Timer for retrying post-connection events */
-    gboolean bt_card_found;
 } VolumePulsePlugin;
 
 extern conf_table_t conf_table[1];

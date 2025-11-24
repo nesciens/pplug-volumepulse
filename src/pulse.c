@@ -305,7 +305,7 @@ static void pa_cb_subscription (pa_context *, pa_subscription_event_type_t event
 #ifdef DEBUG_ON
     DEBUG ("PulseAudio event : %s %s", type, fac);
 #endif
-    if (vol->bt_card_found == FALSE && newcard) vol->bt_card_found = TRUE;
+    if (newcard) vol->pa_card_found = TRUE;
 
     vol->pa_idle_timer = g_idle_add (pa_update_disp_cb, vol);
 
@@ -322,6 +322,26 @@ static gboolean pa_update_disp_cb (gpointer userdata)
     volumepulse_update_display (vol);
     return FALSE;
 }
+
+/* Thread-safely set and reset whether a card has been found. */
+
+gboolean pulse_get_card_found (VolumePulsePlugin *vol) {
+    gboolean res;
+    pa_threaded_mainloop_lock (vol->pa_mainloop);
+    res = vol->pa_card_found;
+    pa_threaded_mainloop_unlock (vol->pa_mainloop);
+    return res;
+}
+
+void pulse_reset_card_found (VolumePulsePlugin *vol) {
+    pa_threaded_mainloop_lock (vol->pa_mainloop);
+    vol->pa_card_found = FALSE;
+    pa_threaded_mainloop_unlock (vol->pa_mainloop);
+}
+
+/*----------------------------------------------------------------------------*/
+/* Generic success/fail operation callback                                    */
+/*----------------------------------------------------------------------------*/
 
 /* Callback for PulseAudio operations which report success/fail */
 
