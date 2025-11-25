@@ -186,13 +186,14 @@ void pulse_init (VolumePulsePlugin *vol)
         pa_threaded_mainloop_wait (vol->pa_mainloop);
     }
 
-    pa_threaded_mainloop_unlock (vol->pa_mainloop);
-
     if (vol->pa_state != PA_CONTEXT_READY)
     {
-        pa_error_handler (vol, "init context");
+        pa_threaded_mainloop_unlock (vol->pa_mainloop);
+        pa_error_handler (vol, "connect context");
         return;
     }
+
+    pa_threaded_mainloop_unlock (vol->pa_mainloop);
 
     vol->pa_default_sink = NULL;
     vol->pa_default_source = NULL;
@@ -205,7 +206,10 @@ void pulse_init (VolumePulsePlugin *vol)
     pulse_move_input_streams (vol);
 }
 
-/* Callback for changes in context state during initialisation */
+/* Callback for changes in context state (particularly during initialisation)
+ *
+ * Run on the pa_threaded_mainloop thread.
+ */
 
 static void pa_cb_state (pa_context *pacontext, void *userdata)
 {
@@ -214,16 +218,18 @@ static void pa_cb_state (pa_context *pacontext, void *userdata)
     if (pacontext == NULL)
     {
         vol->pa_state = PA_CONTEXT_FAILED;
-        pa_threaded_mainloop_signal (vol->pa_mainloop, 0);
-        return;
+    } else {
+        vol->pa_state = pa_context_get_state (pacontext);
     }
 
-    vol->pa_state = pa_context_get_state (pacontext);
-
+    /* This notification is only used during initialisation. */
     pa_threaded_mainloop_signal (vol->pa_mainloop, 0);
 }
 
-/* Teardown PulseAudio controller */
+/* Teardown PulseAudio controller
+ *
+ * Run on the GMainLoop thread, and WITHOUT the pa_threaded_mainloop_lock held.
+ */
 
 void pulse_terminate (VolumePulsePlugin *vol)
 {
@@ -248,14 +254,24 @@ void pulse_terminate (VolumePulsePlugin *vol)
     vol->pa_idle_timer = 0;
 }
 
-/* Handler for unrecoverable errors - terminates the controller */
+/* Handler for unrecoverable errors - terminates the controller
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static void pa_error_handler (VolumePulsePlugin *vol, char *name)
 {
     if (vol->pa_cont != NULL)
     {
+        /* Though the pointee of vol->pa_cont is owned by the
+         * pa_threaded_mainloop thread, accessing its error number here without
+         * pa_threaded_mainloop_lock ought to be okay because the error code
+         * only concerns operations, and we initiate all of those from the
+         * GMainLoop thread and wait for their completion/failure. */
         int code = pa_context_errno (vol->pa_cont);
         g_warning ("%s: err:%d %s\n", name, code, pa_strerror (code));
+    } else {
+        g_warning ("%s: unknown error (NULL context)\n", name);
     }
     pulse_terminate (vol);
 }
@@ -264,17 +280,23 @@ static void pa_error_handler (VolumePulsePlugin *vol, char *name)
 /* Event notification                                                         */
 /*----------------------------------------------------------------------------*/
 
-/* Subscribe to notifications from the Pulse server */
+/* Subscribe to notifications from the Pulse server
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_set_subscription (VolumePulsePlugin *vol)
 {
-    pa_context_set_subscribe_callback (vol->pa_cont, &pa_cb_subscription, vol);
     START_PA_OPERATION
+    pa_context_set_subscribe_callback (vol->pa_cont, &pa_cb_subscription, vol);
     op = pa_context_subscribe (vol->pa_cont, PA_SUBSCRIPTION_MASK_ALL, &pa_cb_generic_success, vol);
     END_PA_OPERATION ("subscribe")
 }
 
-/* Callback for notifications from the Pulse server */
+/* Callback for notifications from the Pulse server
+ *
+ * Run on the pa_threaded_mainloop thread.
+ */
 
 static void pa_cb_subscription (pa_context *, pa_subscription_event_type_t event, uint32_t, void *userdata)
 {
@@ -307,11 +329,9 @@ static void pa_cb_subscription (pa_context *, pa_subscription_event_type_t event
 #ifdef DEBUG_ON
     DEBUG ("PulseAudio event : %s %s", type, fac);
 #endif
-    if (vol->bt_card_found == FALSE && newcard) vol->bt_card_found = TRUE;
+    if (newcard) vol->pa_card_found = TRUE;
 
     if (vol->pa_idle_timer == 0) vol->pa_idle_timer = g_idle_add (pa_update_disp_cb, vol);
-
-    pa_threaded_mainloop_signal (vol->pa_mainloop, 0);
 }
 
 /* Function to update display called when idle after a notification.
@@ -332,7 +352,31 @@ static gboolean pa_update_disp_cb (gpointer userdata)
     return G_SOURCE_REMOVE;
 }
 
-/* Callback for PulseAudio operations which report success/fail */
+/* Thread-safely set and reset whether a card has been found. */
+
+gboolean pulse_get_card_found (VolumePulsePlugin *vol) {
+    gboolean res;
+    pa_threaded_mainloop_lock (vol->pa_mainloop);
+    res = vol->pa_card_found;
+    pa_threaded_mainloop_unlock (vol->pa_mainloop);
+    return res;
+}
+
+void pulse_reset_card_found (VolumePulsePlugin *vol) {
+    pa_threaded_mainloop_lock (vol->pa_mainloop);
+    vol->pa_card_found = FALSE;
+    pa_threaded_mainloop_unlock (vol->pa_mainloop);
+}
+
+/*----------------------------------------------------------------------------*/
+/* Generic success/fail operation callback                                    */
+/*----------------------------------------------------------------------------*/
+
+/* Callback for PulseAudio operations which report success/fail
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_generic_success (pa_context *context, int success, void *userdata)
 {
@@ -351,7 +395,7 @@ static void pa_cb_generic_success (pa_context *context, int success, void *userd
 /* Volume and mute control                                                    */
 /*----------------------------------------------------------------------------*/
 
-/* 
+/*
  * For get operations, the generic get_sink_info operation is called on the
  * current default sink; the values are written into the global structure
  * by the callbacks, and the top-level functions return them from there.
@@ -403,7 +447,10 @@ int pulse_set_mute (VolumePulsePlugin *vol, int mute, gboolean input_control)
     END_PA_OPERATION ("set_sink_mute_by_name");
 }
 
-/* Query the controller for the volume and mute settings for the current default sink */
+/* Query the controller for the volume and mute settings for the current default sink
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_get_current_vol_mute (VolumePulsePlugin *vol, gboolean input_control)
 {
@@ -415,7 +462,11 @@ static int pa_get_current_vol_mute (VolumePulsePlugin *vol, gboolean input_contr
     END_PA_OPERATION ("get_sink_info_by_name")
 }
 
-/* Callback for volume / mute query */
+/* Callback for output volume / mute query
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_get_current_vol_mute (pa_context *, const pa_sink_info *i, int eol, void *userdata)
 {
@@ -431,6 +482,12 @@ static void pa_cb_get_current_vol_mute (pa_context *, const pa_sink_info *i, int
     pa_threaded_mainloop_signal (vol->pa_mainloop, 0);
 }
 
+/* Callback for input volume / mute query
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
+
 static void pa_cb_get_current_input_vol_mute (pa_context *, const pa_source_info *i, int eol, void *userdata)
 {
     VolumePulsePlugin *vol = (VolumePulsePlugin *) userdata;
@@ -445,7 +502,10 @@ static void pa_cb_get_current_input_vol_mute (pa_context *, const pa_source_info
     pa_threaded_mainloop_signal (vol->pa_mainloop, 0);
 }
 
-/* Set volume for new sink to global value read from old sink */
+/* Set volume for new sink to global value read from old sink
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_restore_volume (VolumePulsePlugin *vol)
 {
@@ -461,7 +521,10 @@ static int pa_restore_volume (VolumePulsePlugin *vol)
     END_PA_OPERATION ("set_sink_volume_by_name")
 }
 
-/* Set mute for new sink to global value read from old sink */
+/* Set mute for new sink to global value read from old sink
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_restore_mute (VolumePulsePlugin *vol)
 {
@@ -471,7 +534,10 @@ static int pa_restore_mute (VolumePulsePlugin *vol)
     END_PA_OPERATION ("set_sink_mute_by_name");
 }
 
-/* Query the controller for the number of channels on the current default sink */
+/* Query the controller for the number of channels on the current default sink
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_get_channels (VolumePulsePlugin *vol)
 {
@@ -480,7 +546,11 @@ static int pa_get_channels (VolumePulsePlugin *vol)
     END_PA_OPERATION ("get_sink_info_by_name")
 }
 
-/* Callback for volume / mute query */
+/* Callback for channels query
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_get_channels (pa_context *, const pa_sink_info *i, int eol, void *userdata)
 {
@@ -498,7 +568,7 @@ static void pa_cb_get_channels (pa_context *, const pa_sink_info *i, int eol, vo
 /* Sink and source control                                                    */
 /*----------------------------------------------------------------------------*/
 
-/* Update the names of the current default sink and source in the plugin data structure */
+/* Update the names of the current PulseAudio default sink and source in the plugin data structure */
 
 int pulse_get_default_sink_source (VolumePulsePlugin *vol)
 {
@@ -508,7 +578,11 @@ int pulse_get_default_sink_source (VolumePulsePlugin *vol)
     END_PA_OPERATION ("get_server_info")
 }
 
-/* Callback for default sink and source query */
+/* Callback for default sink and source query
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_get_default_sink_source (pa_context *, const pa_server_info *i, void *userdata)
 {
@@ -525,10 +599,11 @@ static void pa_cb_get_default_sink_source (pa_context *, const pa_server_info *i
 }
 
 /*
- * To change sink, first the default sink is updated to the new sink.
- * Then, all currently active output streams are listed in pa_indices.
- * Finally, all streams listed in pa_indices are moved to the new sink.
+ * To change sink, first update the default sink to the new sink.
+ * Then, move all streams to the new sink.
  */
+
+/* Update the default sink */
 
 int pulse_change_sink (VolumePulsePlugin *vol, const char *sinkname)
 {
@@ -563,7 +638,10 @@ void pulse_move_output_streams (VolumePulsePlugin *vol)
     DEBUG ("pulse_move_output_streams done");
 }
 
-/* Call the PulseAudio set default sink operation */
+/* Call the PulseAudio set default sink operation
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_set_default_sink (VolumePulsePlugin *vol, const char *sinkname)
 {
@@ -573,7 +651,10 @@ static int pa_set_default_sink (VolumePulsePlugin *vol, const char *sinkname)
     END_PA_OPERATION ("set_default_sink")
 }
 
-/* Query the controller for a list of current output streams */
+/* Query the controller for a list of current output streams
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_get_output_streams (VolumePulsePlugin *vol)
 {
@@ -583,7 +664,11 @@ static int pa_get_output_streams (VolumePulsePlugin *vol)
     END_PA_OPERATION ("get_sink_input_info_list")
 }
 
-/* Callback for output stream query */
+/* Callback for output stream query
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_get_output_streams (pa_context *, const pa_sink_input_info *i, int eol, void *userdata)
 {
@@ -598,7 +683,10 @@ static void pa_cb_get_output_streams (pa_context *, const pa_sink_input_info *i,
     pa_threaded_mainloop_signal (vol->pa_mainloop, 0);
 }
 
-/* Callback for per-stream operation by looping through pa_indices, moving stream for each */
+/* Callback for per-stream operation by looping through pa_indices, moving stream for each
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static void pa_list_move_to_default_sink (gpointer data, gpointer userdata)
 {
@@ -607,7 +695,10 @@ static void pa_list_move_to_default_sink (gpointer data, gpointer userdata)
     pa_move_stream_to_default_sink (vol, (uintptr_t) data);
 }
 
-/* Call the PulseAudio move stream operation for the supplied index to move the stream to the default sink */
+/* Call the PulseAudio move stream operation for the supplied index to move the stream to the default sink
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_move_stream_to_default_sink (VolumePulsePlugin *vol, int index)
 {
@@ -618,11 +709,10 @@ static int pa_move_stream_to_default_sink (VolumePulsePlugin *vol, int index)
 }
 
 /*
- * To change source, first the default source is updated to the new source.
- * Then, all currently active input streams are listed in pa_indices.
- * Finally, all streams listed in pa_indices are moved to the new source.
+ * To change source, first update the default source to the new source.
+ * Then, move all streams to the new sink.
  */
- 
+
 int pulse_change_source (VolumePulsePlugin *vol, const char *sourcename)
 {
     DEBUG ("pulse_change_source %s", sourcename);
@@ -639,7 +729,10 @@ int pulse_change_source (VolumePulsePlugin *vol, const char *sourcename)
     return 1;
 }
 
-/* Call the PulseAudio set default source operation */
+/* Call the PulseAudio set default source operation
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_set_default_source (VolumePulsePlugin *vol, const char *sourcename)
 {
@@ -661,7 +754,10 @@ void pulse_move_input_streams (VolumePulsePlugin *vol)
     DEBUG ("pulse_move_input_streams done");
 }
 
-/* Query the controller for a list of current output streams */
+/* Query the controller for a list of current output streams
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_get_input_streams (VolumePulsePlugin *vol)
 {
@@ -671,7 +767,11 @@ static int pa_get_input_streams (VolumePulsePlugin *vol)
     END_PA_OPERATION ("get_sink_input_info_list")
 }
 
-/* Callback for input stream query */
+/* Callback for input stream query
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_get_input_streams (pa_context *, const pa_source_output_info *i, int eol, void *userdata)
 {
@@ -686,7 +786,10 @@ static void pa_cb_get_input_streams (pa_context *, const pa_source_output_info *
     pa_threaded_mainloop_signal (vol->pa_mainloop, 0);
 }
 
-/* Callback for per-stream operation by looping through pa_indices, moving stream for each */
+/* Callback for per-stream operation by looping through pa_indices, moving stream for each
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static void pa_list_move_to_default_source (gpointer data, gpointer userdata)
 {
@@ -695,7 +798,10 @@ static void pa_list_move_to_default_source (gpointer data, gpointer userdata)
     pa_move_stream_to_default_source (vol, (uintptr_t) data);
 }
 
-/* Call the PulseAudio move stream operation for the supplied index to move the stream to the default source */
+/* Call the PulseAudio move stream operation for the supplied index to move the stream to the default source
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_move_stream_to_default_source (VolumePulsePlugin *vol, int index)
 {
@@ -720,7 +826,10 @@ void pulse_mute_all_streams (VolumePulsePlugin *vol)
     DEBUG ("pulse_mute_all_streams done");
 }
 
-/* Callback for per-stream operation by looping through pa_indices, muting stream for each */
+/* Callback for per-stream operation by looping through pa_indices, muting stream for each
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static void pa_list_mute_stream (gpointer data, gpointer userdata)
 {
@@ -729,7 +838,10 @@ static void pa_list_mute_stream (gpointer data, gpointer userdata)
     pa_mute_stream (vol, (uintptr_t) data);
 }
 
-/* Call the PulseAudio mute stream operation for the supplied index*/
+/* Call the PulseAudio mute stream operation for the supplied index
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_mute_stream (VolumePulsePlugin *vol, int index)
 {
@@ -750,7 +862,10 @@ void pulse_unmute_all_streams (VolumePulsePlugin *vol)
     DEBUG ("pulse_unmute_all_streams done");
 }
 
-/* Callback for per-stream operation by looping through pa_indices, unmuting stream for each */
+/* Callback for per-stream operation by looping through pa_indices, unmuting stream for each
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static void pa_list_unmute_stream (gpointer data, gpointer userdata)
 {
@@ -759,7 +874,10 @@ static void pa_list_unmute_stream (gpointer data, gpointer userdata)
     pa_unmute_stream (vol, (uintptr_t) data);
 }
 
-/* Call the PulseAudio unmute stream operation for the supplied index*/
+/* Call the PulseAudio unmute stream operation for the supplied index
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_unmute_stream (VolumePulsePlugin *vol, int index)
 {
@@ -792,7 +910,11 @@ int pulse_get_profile (VolumePulsePlugin *vol, const char *card)
     END_PA_OPERATION ("get_card_info_by_name")
 }
 
-/* Callback for profile query */
+/* Callback for profile query
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_get_profile (pa_context *, const pa_card_info *i, int eol, void *userdata)
 {
@@ -850,6 +972,9 @@ int pulse_add_devices_to_menu (VolumePulsePlugin *vol, gboolean internal, gboole
 /*
  * Callbacks for card info query, each of which checks to see if the device should
  * be in the menu in question and adding it if so
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
  */
 
 static void pa_cb_get_info_inputs (pa_context *, const pa_card_info *i, int eol, void *userdata)
@@ -865,6 +990,12 @@ static void pa_cb_get_info_inputs (pa_context *, const pa_card_info *i, int eol,
             if (nam)
             {
                 DEBUG ("pa_cb_get_info_inputs %s", dev);
+                /* TODO: Is this access to GTK objects safe?
+                 *
+                 * The GMainLoop thread is paused, but the GTK objects could
+                 * potentially be unhappy with the thread-local data on the
+                 * unfamiliar thread.
+                 */
                 menu_add_item (vol, nam, dev, TRUE);
             }
         }
@@ -889,6 +1020,12 @@ static void pa_cb_get_info_internal (pa_context *, const pa_card_info *i, int eo
                 {
                     if (!strcmp (nam, "bcm2835 Headphones") && vsystem ("raspi-config nonint has_analog")) return;
                     DEBUG ("pa_cb_get_info_internal %s", dev);
+                    /* TODO: Is this access to GTK objects safe?
+                     *
+                     * The GMainLoop thread is paused, but the GTK objects
+                     * could potentially be unhappy with the thread-local data
+                     * on the unfamiliar thread.
+                     */
                     menu_add_item (vol, nam, dev, FALSE);
                 }
             }
@@ -913,6 +1050,12 @@ static void pa_cb_get_info_external (pa_context *, const pa_card_info *i, int eo
                 if (nam)
                 {
                     DEBUG ("pa_cb_get_info_external %s", dev);
+                    /* TODO: Is this access to GTK objects safe?
+                     *
+                     * The GMainLoop thread is paused, but the GTK objects
+                     * could potentially be unhappy with the thread-local data
+                     * on the unfamiliar thread.
+                     */
                     menu_add_separator (vol, vol->menu_devices[0]);
                     menu_add_item (vol, nam, dev, FALSE);
                 }
@@ -945,7 +1088,10 @@ void pulse_update_devices_in_menu (VolumePulsePlugin *vol, gboolean input_contro
     else pa_replace_cards_with_sinks (vol);
 }
 
-/* Query controller for list of sinks */
+/* Query controller for list of sinks
+ *
+ * Run on the GMainLoop thread
+ */
 
 static int pa_replace_cards_with_sinks (VolumePulsePlugin *vol)
 {
@@ -955,7 +1101,11 @@ static int pa_replace_cards_with_sinks (VolumePulsePlugin *vol)
     END_PA_OPERATION ("get_sink_info_list")
 }
 
-/* Callback for sink list query, which updates ALSA devices in menu as appropriate */
+/* Callback for sink list query, which updates ALSA devices in menu as appropriate
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_replace_cards_with_sinks (pa_context *, const pa_sink_info *i, int eol, void *userdata)
 {
@@ -964,6 +1114,12 @@ static void pa_cb_replace_cards_with_sinks (pa_context *, const pa_sink_info *i,
     if (!eol && vol->menu_devices[0])
     {
         const char *api = pa_proplist_gets (i->proplist, "device.api");
+        /* TODO: Is this access to GTK objects safe?
+         *
+         * The GMainLoop thread is paused, but the GTK objects could
+         * potentially be unhappy with the thread-local data on the unfamiliar
+         * thread.
+         */
         if (!g_strcmp0 (api, "alsa"))
             gtk_container_foreach (GTK_CONTAINER (vol->menu_devices[0]), pa_replace_card_with_sink_on_match, (void *) i);
         else
@@ -1006,7 +1162,10 @@ static void pa_card_check_bt_output_profile (GtkWidget *widget, gpointer data)
     }
 }
 
-/* Query controller for list of sources */
+/* Query controller for list of sources
+ *
+ * Run on the GMainLoop thread.
+ */
 
 static int pa_replace_cards_with_sources (VolumePulsePlugin *vol)
 {
@@ -1016,7 +1175,11 @@ static int pa_replace_cards_with_sources (VolumePulsePlugin *vol)
     END_PA_OPERATION ("get_source_info_list")
 }
 
-/* Callback for source list query, which updates ALSA devices in menu as appropriate */
+/* Callback for source list query, which updates ALSA devices in menu as appropriate
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_replace_cards_with_sources (pa_context *, const pa_source_info *i, int eol, void *userdata)
 {
@@ -1025,6 +1188,12 @@ static void pa_cb_replace_cards_with_sources (pa_context *, const pa_source_info
     if (!eol && vol->menu_devices[1])
     {
         const char *api = pa_proplist_gets (i->proplist, "device.api");
+        /* TODO: Is this access to GTK objects safe?
+         *
+         * The GMainLoop thread is paused, but the GTK objects could
+         * potentially be unhappy with the thread-local data on the unfamiliar
+         * thread.
+         */
         if (!g_strcmp0 (api, "alsa"))
             gtk_container_foreach (GTK_CONTAINER (vol->menu_devices[1]), pa_replace_card_with_source_on_match, (void *) i);
         else
@@ -1081,7 +1250,11 @@ int pulse_add_devices_to_profile_dialog (VolumePulsePlugin *vol)
     END_PA_OPERATION ("get_card_info_list")
 }
 
-/* Callback for card list query - reads profiles for card and adds as a combo box to profiles dialog */
+/* Callback for card list query - reads profiles for card and adds as a combo box to profiles dialog
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
+ */
 
 static void pa_cb_add_devices_to_profile_dialog (pa_context *, const pa_card_info *i, int eol, void *userdata)
 {
@@ -1092,6 +1265,13 @@ static void pa_cb_add_devices_to_profile_dialog (pa_context *, const pa_card_inf
 
     if (!eol)
     {
+        /* TODO: Is this access to GTK objects safe?
+         *
+         * The GMainLoop thread is paused, but the GTK objects could
+         * potentially be unhappy with the thread-local data on the unfamiliar
+         * thread.
+         */
+
         // loop through profiles, adding each to list store
         ls = gtk_list_store_new (2, G_TYPE_STRING, G_TYPE_STRING);
         pa_card_profile_info2 **profile = i->profiles2;
@@ -1137,6 +1317,9 @@ int pulse_count_devices (VolumePulsePlugin *vol, gboolean input_control)
 /*
  * Callbacks for card count query, each of which just increments the global device counter
  * whenever a matching device is found
+ *
+ * Run on the pa_threaded_mainloop thread with the GMainLoop thread in
+ * pa_threaded_mainloop_wait.
  */
 
 static void pa_cb_count_inputs (pa_context *, const pa_card_info *i, int eol, void *userdata)

@@ -77,8 +77,20 @@ typedef struct
 
     /* PulseAudio interface */
     pa_threaded_mainloop *pa_mainloop;  /* Controller loop variable */
+
+    /* PulseAudio interface: Fields with mixed ownership */
+    /* The pointer is owned by the main GMainLoop thread, while the pointee is
+     * owned by the pa_threaded_mainloop thread. */
     pa_context *pa_cont;                /* Controller context */
+
+    /* PulseAudio interface: Fields owned by the pa_threaded_mainloop thread */
+    /* Access from that thread, or while holding pa_threaded_mainloop_lock. */
     pa_context_state_t pa_state;        /* Current controller state */
+    gboolean pa_card_found;             /* Whether a new card has been found since this was reset */  
+    guint pa_idle_timer;                /* Tag of the idle source for updating the display */
+
+    /* PulseAudio interface: Fields owned by the main GMainLoop thread */
+    /* Access from that thread, or while that thread is waiting for you in pa_threaded_mainloop_wait. */ 
     char *pa_default_sink;              /* Current default sink name */
     char *pa_default_source;            /* Current default source name */
     char *pa_profile;                   /* Current profile for card */
@@ -88,7 +100,6 @@ typedef struct
     GList *pa_indices;                  /* Indices for current streams */
     char *pa_error_msg;                 /* Error message from success / fail callback */
     int pa_devices;                     /* Counter for pulse devices */
-    guint pa_idle_timer;
 
     /* Bluetooth interface */
     GDBusObjectManager *bt_objmanager;  /* D-Bus BlueZ object manager */
@@ -98,7 +109,6 @@ typedef struct
     gboolean bt_force_hsp;              /* Flag to override automatic profile selection */
     int bt_retry_count;                 /* Counter for polling read of profile on connection */
     guint bt_retry_timer;               /* Timer for retrying post-connection events */
-    gboolean bt_card_found;
 } VolumePulsePlugin;
 
 extern conf_table_t conf_table[1];
